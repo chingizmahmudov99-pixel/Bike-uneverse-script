@@ -1,11 +1,17 @@
 --!nonstrict
 --[[
-    Bike Universe Hub — fully patched edition.
-    
-    AirFlow is embedded via URL+cache (as before) — if you want FULL offline,
-    paste file-2 content into EMBED_LIBRARY string below.
+    Bike Universe Hub v2.3 — fully patched.
 
-    All bug fixes documented above.
+    Changelog v2.3:
+      • PowerPerKg max 250 → 400
+      • New Farm function: Keep ForestTrees removed (with respawn watch)
+      • Fixed scriptAlive forward-declaration bug (would error on load)
+      • myBike() cached + workspace.DescendantAdded instant invalidation
+      • pumpkinList() cached (3s TTL)
+      • landmarkCFrame now recursive
+      • jumpOnce no-bike wait 0.2 → 0.4s
+      • Pumpkin target uses Body/Hitbox/PrimaryPart
+      • All watchers gated by scriptAlive()
 ]]
 
 -- ==========================================================================
@@ -21,7 +27,7 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
 -- ==========================================================================
--- 2. ENV helper
+-- 2. ENV + generation (defined early so §8 can use scriptAlive)
 -- ==========================================================================
 local function getEnv()
     if type(getgenv) == "function" then
@@ -32,6 +38,13 @@ local function getEnv()
     return _G
 end
 local ENV = getEnv()
+
+ENV.__BikeHubGen = (ENV.__BikeHubGen or 0) + 1
+local SCRIPT_GENERATION = ENV.__BikeHubGen
+
+local function scriptAlive()
+    return ENV.__BikeHubGen == SCRIPT_GENERATION
+end
 
 local Ragdoll
 pcall(function()
@@ -45,10 +58,10 @@ local function short(value)
 end
 
 -- ==========================================================================
--- 3. AirFlow loading (cache → URL → error)
---   To embed file-2 fully: set EMBED_LIBRARY = [[<file 2 content>]]
+-- 3. AirFlow loading
+--    To embed file-2 fully offline: local EMBED_LIBRARY = [[ <file2> ]]
 -- ==========================================================================
-local EMBED_LIBRARY = nil  -- ← paste file 2 between [[...]] for full offline
+local EMBED_LIBRARY = nil
 
 local UI_CACHE    = "BikeHub_AirflowCache.lua"
 local UI_SOURCES  = {
@@ -102,9 +115,21 @@ if not Airflow then
 end
 
 -- ==========================================================================
--- 4. Bike helpers (FIXED — recursive scan)
+-- 4. Bike helpers (cached)
 -- ==========================================================================
-local function myBike()
+local bikeCache = nil
+local bikeCacheLastScan = 0
+local BIKE_SCAN_INTERVAL = 0.2
+
+workspace.DescendantAdded:Connect(function(child)
+    if not scriptAlive() then return end
+    if child:IsA("Model") and child:GetAttribute("Owner") == LocalPlayer.UserId then
+        bikeCache = child
+        bikeCacheLastScan = 0
+    end
+end)
+
+local function scanForBike()
     local found
     local function scan(inst, depth)
         if found or depth > 4 then return end
@@ -118,6 +143,23 @@ local function myBike()
         end
     end
     scan(workspace, 0)
+    return found
+end
+
+local function myBike()
+    if bikeCache and bikeCache.Parent then
+        if bikeCache:GetAttribute("Owner") == LocalPlayer.UserId then
+            return bikeCache
+        end
+        bikeCache = nil
+    end
+    local now = os.clock()
+    if (now - bikeCacheLastScan) < BIKE_SCAN_INTERVAL then
+        return nil
+    end
+    bikeCacheLastScan = now
+    local found = scanForBike()
+    bikeCache = found
     return found
 end
 
@@ -160,7 +202,7 @@ local function cash()
 end
 
 -- ==========================================================================
--- 5. Drive control (FIXED — VehicleSeat fallback)
+-- 5. Drive control
 -- ==========================================================================
 local TouchControls
 pcall(function()
@@ -206,7 +248,6 @@ local function driveStop()
     driveState.steer = 0
 end
 
--- FIXED: fallback to VehicleSeat fields
 local function applyDrive(throttle, steer)
     throttle = throttle or 0
     steer = steer or 0
@@ -256,7 +297,7 @@ local function releaseKeys()
 end
 
 -- ==========================================================================
--- 7. Seating / bike spawn (IMPROVED)
+-- 7. Seating / bike spawn
 -- ==========================================================================
 local log
 local riderLockSet
@@ -283,6 +324,8 @@ spawnBike = function()
         end
     end
     for _, remote in ipairs(remotes) do
+        bikeCache = nil
+        bikeCacheLastScan = 0
         pcall(function() remote:FireServer() end)
         for _ = 1, 10 do
             task.wait(0.2)
@@ -370,7 +413,7 @@ local function seatUp()
 end
 
 -- ==========================================================================
--- 8. Never-crash hook (FIXED — expanded)
+-- 8. Never-crash + rider lock tick loop
 -- ==========================================================================
 if Ragdoll and type(Ragdoll.fling) == "function" and not ENV.__BikeHubFlingHooked then
     ENV.__BikeHubFlingHooked = true
@@ -407,7 +450,6 @@ local function riderLockTick()
     if state == Enum.HumanoidStateType.Ragdoll or state == Enum.HumanoidStateType.FallingDown then
         pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
     end
-    -- Anti-flip: kill extreme angular velocity
     if ENV.__BikeHubRiderLock then
         local part = chassis()
         if part and part:IsA("BasePart") then
@@ -419,7 +461,6 @@ local function riderLockTick()
     end
 end
 
--- FIXED: riderLockTick now runs every 50ms
 task.spawn(function()
     while scriptAlive() do
         if ENV.__BikeHubRiderLock then
@@ -447,15 +488,8 @@ local Stats = {
 local Window
 local UiRefs = {}
 
-ENV.__BikeHubGen = (ENV.__BikeHubGen or 0) + 1
-local SCRIPT_GENERATION = ENV.__BikeHubGen
-
-local function scriptAlive()
-    return ENV.__BikeHubGen == SCRIPT_GENERATION
-end
-
 -- ==========================================================================
--- 10. TELEPORT FARM (FIXED)
+-- 10. TELEPORT FARM
 -- ==========================================================================
 local anchor
 
@@ -478,7 +512,7 @@ local function jumpOnce()
     local bike, part = myBike(), chassis()
     if not (bike and part) then
         spawnBike()
-        task.wait(0.2)
+        task.wait(0.4)
         return false
     end
     if not part:IsA("BasePart") then
@@ -581,7 +615,60 @@ local function farmSet(on)
 end
 
 -- ==========================================================================
--- 11. WHEELIE (FIXED — uses applyDrive)
+-- 11. Forest trees remover
+-- ==========================================================================
+local forestWatchConn = nil
+
+local function findForestFolder()
+    return workspace:FindFirstChild("ForestTrees")
+        or workspace:FindFirstChild("ForestTrees", true)
+end
+
+local function purgeForestFolder(folder)
+    if not folder or not folder.Parent then return 0 end
+    local count = 0
+    for _, child in ipairs(folder:GetChildren()) do
+        if pcall(function() child:Destroy() end) then
+            count += 1
+        end
+    end
+    pcall(function() folder:Destroy() end)
+    return count
+end
+
+local function forestAutoRemove(on)
+    if on then
+        local folder = findForestFolder()
+        if folder then
+            local n = purgeForestFolder(folder)
+            log(string.format("<Success>Removed ForestTrees: %d object(s) + folder</Success>", n))
+        else
+            log("ForestTrees not found (nothing to remove — still watching)")
+        end
+        if forestWatchConn then forestWatchConn:Disconnect() end
+        forestWatchConn = workspace.ChildAdded:Connect(function(child)
+            if not scriptAlive() then return end
+            if child.Name ~= "ForestTrees" then return end
+            task.defer(function()
+                task.wait(0.05)
+                if child and child.Parent then
+                    local n = purgeForestFolder(child)
+                    log(string.format("<Success>ForestTrees respawned — removed again (%d objects)</Success>", n))
+                end
+            end)
+        end)
+        log("ForestTrees watch active")
+    else
+        if forestWatchConn then
+            forestWatchConn:Disconnect()
+            forestWatchConn = nil
+            log("ForestTrees watch stopped (already removed stay removed)")
+        end
+    end
+end
+
+-- ==========================================================================
+-- 12. WHEELIE
 -- ==========================================================================
 local function wheelieCycle(throttle)
     key(Enum.KeyCode.LeftControl, false)
@@ -621,7 +708,7 @@ local function wheelieSet(on)
 end
 
 -- ==========================================================================
--- 12. RIDER LOCK toggle
+-- 13. RIDER LOCK toggle
 -- ==========================================================================
 riderLockSet = function(on)
     Settings.riderLock = on
@@ -631,44 +718,72 @@ riderLockSet = function(on)
 end
 
 -- ==========================================================================
--- 13. PUMPKIN FARM (FIXED)
+-- 14. PUMPKIN FARM (cached list)
 -- ==========================================================================
+local pumpkinCache = nil
+local pumpkinCacheTime = 0
+local PUMPKIN_CACHE_TTL = 3
+
 pumpkinList = function()
     local list = {}
     local seen = {}
+
     local function add(p)
         if p and not seen[p] then
             seen[p] = true
             table.insert(list, p)
         end
     end
-    local function inspect(child)
-        if child:IsA("Model") then
-            local n = child.Name:lower()
-            local isPumpkin = n:find("pumpkin") or child:GetAttribute("Pumpkin") or child:GetAttribute("IsPumpkin")
-            if isPumpkin and (child.PrimaryPart or child:FindFirstChild("Body") or child:FindFirstChild("Hitbox")) then
-                add(child)
-            end
-        end
+
+    local function isPumpkinModel(child)
+        if not child:IsA("Model") then return false end
+        local n = child.Name:lower()
+        local flagged = n:find("pumpkin")
+            or child:GetAttribute("Pumpkin")
+            or child:GetAttribute("IsPumpkin")
+        if not flagged then return false end
+        return child.PrimaryPart ~= nil
+            or child:FindFirstChild("Body") ~= nil
+            or child:FindFirstChild("Hitbox") ~= nil
     end
+
     for _, name in ipairs({"MyPumpkins", "Pumpkins", "PumpkinFolder", "Farm"}) do
         local folder = workspace:FindFirstChild(name)
         if folder then
-            for _, child in ipairs(folder:GetChildren()) do inspect(child) end
-        end
-    end
-    if #list == 0 then
-        local function scan(inst, depth)
-            if depth > 4 then return end
-            for _, child in ipairs(inst:GetChildren()) do
-                inspect(child)
-                if not child:IsA("Model") or child:IsA("Folder") then
-                    scan(child, depth + 1)
-                end
+            for _, child in ipairs(folder:GetChildren()) do
+                if isPumpkinModel(child) then add(child) end
             end
         end
-        scan(workspace, 0)
     end
+
+    if #list > 0 then
+        pumpkinCache = list
+        pumpkinCacheTime = os.clock()
+        return list
+    end
+
+    local now = os.clock()
+    if pumpkinCache and (now - pumpkinCacheTime) < PUMPKIN_CACHE_TTL then
+        local valid = true
+        for _, p in ipairs(pumpkinCache) do
+            if not p.Parent then valid = false; break end
+        end
+        if valid then return pumpkinCache end
+    end
+
+    local function scan(inst, depth)
+        if depth > 4 then return end
+        for _, child in ipairs(inst:GetChildren()) do
+            if isPumpkinModel(child) then add(child) end
+            if not child:IsA("Model") or child:IsA("Folder") then
+                scan(child, depth + 1)
+            end
+        end
+    end
+    scan(workspace, 0)
+
+    pumpkinCache = list
+    pumpkinCacheTime = now
     return list
 end
 
@@ -681,23 +796,34 @@ local function pumpkinSet(on)
             while Settings.pumpkinFarm and scriptAlive() do
                 local bike = myBike()
                 if not bike then
-                    spawnBike(); task.wait(1)
+                    spawnBike()
+                    task.wait(1)
                 elseif not isRiding() then
-                    seatUp(); task.wait(0.3)
+                    seatUp()
+                    task.wait(0.3)
                 else
                     local list = pumpkinList()
                     if #list > 0 then
                         local bikePos = bike:GetPivot().Position
                         local nearest, best
                         for _, pumpkin in ipairs(list) do
-                            local d = (pumpkin:GetPivot().Position - bikePos).Magnitude
-                            if not best or d < best then
-                                nearest, best = pumpkin, d
+                            if pumpkin.Parent then
+                                local d = (pumpkin:GetPivot().Position - bikePos).Magnitude
+                                if not best or d < best then
+                                    nearest, best = pumpkin, d
+                                end
                             end
                         end
                         if nearest then
+                            local target = nearest:GetPivot()
+                            local body = nearest:FindFirstChild("Body")
+                                or nearest:FindFirstChild("Hitbox")
+                                or nearest.PrimaryPart
+                            if body and body:IsA("BasePart") then
+                                target = CFrame.new(body.Position)
+                            end
                             applyDrive(1, 0)
-                            teleportBike(nearest:GetPivot() * CFrame.new(0, 4, 0))
+                            teleportBike(target * CFrame.new(0, 4, 0))
                             task.wait(0.35)
                             applyDrive(1, 0)
                             task.wait(0.35)
@@ -717,7 +843,7 @@ local function pumpkinSet(on)
 end
 
 -- ==========================================================================
--- 14. ESP
+-- 15. ESP
 -- ==========================================================================
 local esp = { player = {}, police = {} }
 
@@ -773,7 +899,8 @@ local function refreshPlayerEsp()
     local me = bikePosition()
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer and player.Character then
-            local torso = player.Character:FindFirstChild("HumanoidRootPart") or player.Character:FindFirstChild("Torso")
+            local torso = player.Character:FindFirstChild("HumanoidRootPart")
+                or player.Character:FindFirstChild("Torso")
             if torso then
                 alive[torso] = true
                 if not esp.player[torso] then
@@ -830,7 +957,7 @@ task.spawn(function()
 end)
 
 -- ==========================================================================
--- 15. BIKE TUNING (IMPROVED — watches subfolders)
+-- 16. BIKE TUNING
 -- ==========================================================================
 local TUNING_DEFAULTS = {
     MaxSpeedKmh = 400, LaunchAccel = 5.5, PowerPerKg = 250,
@@ -854,7 +981,7 @@ if TUNING_VALUES.BrakeDecel == 7 then TUNING_VALUES.BrakeDecel = 22 end
 if TUNING_VALUES.TireGrip  == 0.95 then TUNING_VALUES.TireGrip = 1.35 end
 if TUNING_VALUES.LaunchAccel == 4.2 then TUNING_VALUES.LaunchAccel = 5.5 end
 if TUNING_VALUES.MaxSpeedKmh > 400 then TUNING_VALUES.MaxSpeedKmh = 400 end
-if TUNING_VALUES.PowerPerKg > 250 then TUNING_VALUES.PowerPerKg = 250 end
+if TUNING_VALUES.PowerPerKg > 400 then TUNING_VALUES.PowerPerKg = 400 end
 if TUNING_VALUES.TireGrip > 3 then TUNING_VALUES.TireGrip = 3 end
 if TUNING_VALUES.BrakeDecel > 50 then TUNING_VALUES.BrakeDecel = 50 end
 if TUNING_VALUES.LaunchAccel > 30 then TUNING_VALUES.LaunchAccel = 30 end
@@ -894,9 +1021,9 @@ local function resetTuning()
     log("Bike tuning reset to defaults")
 end
 
--- Watch any container for a bike spawn (recursive)
 local function watchContainer(container)
     container.ChildAdded:Connect(function(child)
+        if not scriptAlive() then return end
         if child:IsA("Model") and child:GetAttribute("Owner") == LocalPlayer.UserId then
             task.spawn(function()
                 for _, delayTime in ipairs({ 0, 0.15, 0.5, 1, 2 }) do
@@ -932,7 +1059,7 @@ task.spawn(function()
 end)
 
 -- ==========================================================================
--- 16. HANDLING / BRAKE ASSIST (FIXED — Heartbeat loop)
+-- 17. HANDLING / BRAKE ASSIST
 -- ==========================================================================
 local lastHandlingTick = os.clock()
 
@@ -960,8 +1087,8 @@ local function handlingTick()
                 local targetUp = Vector3.new(0, 1, 0)
                 local axis = up:Cross(targetUp)
                 if axis.Magnitude > 0.01 then
-                    local error = 1 - up.Y
-                    local correction = axis.Unit * (error * 12)
+                    local errorAmt = 1 - up.Y
+                    local correction = axis.Unit * (errorAmt * 12)
                     part.AssemblyAngularVelocity = part.AssemblyAngularVelocity * 0.6 + correction
                 end
             end
@@ -1001,7 +1128,7 @@ RunService.Heartbeat:Connect(function()
 end)
 
 -- ==========================================================================
--- 17. TELEPORTS
+-- 18. TELEPORTS
 -- ==========================================================================
 local LANDMARKS = {
     "HighwayEntery", "LongHighway", "HighwayRace", "HighwayTunnels",
@@ -1044,7 +1171,7 @@ teleportBike = function(cframe)
 end
 
 local function landmarkCFrame(name)
-    local model = workspace:FindFirstChild(name)
+    local model = workspace:FindFirstChild(name) or workspace:FindFirstChild(name, true)
     if model and model:IsA("Model") then
         return model:GetPivot() * CFrame.new(0, 4, 0)
     end
@@ -1052,7 +1179,7 @@ local function landmarkCFrame(name)
 end
 
 -- ==========================================================================
--- 18. WINDOW
+-- 19. WINDOW
 -- ==========================================================================
 local THEME = {
     Background = Color3.fromHex("#0A0A0C"),
@@ -1098,7 +1225,7 @@ log = function(message)
 end
 
 -- ==========================================================================
--- 19. FARM TAB
+-- 20. FARM TAB
 -- ==========================================================================
 local FarmTab  = Window:CreateTab({ Name = "Farm", Icon = "coins" })
 local FarmMain = FarmTab:CreateGroupbox({ Name = "Air time farm", Side = "Left" })
@@ -1124,6 +1251,15 @@ FarmMain:CreateSlider({
     Range = { 0.2, 3 }, Increment = 0.1, Suffix = " s",
     CurrentValue = 0.6, Flag = "JumpCooldown",
     Callback = function(value) Settings.cooldown = value end,
+})
+
+FarmMain:CreateDivider({ Text = "world" })
+
+UiRefs.forestTrees = FarmMain:CreateToggle({
+    Name = "Keep ForestTrees removed",
+    Desc = "Deletes Workspace.ForestTrees (+ everything inside) and re-removes on respawn",
+    Flag = "ForestRemove", CurrentValue = false,
+    Callback = function(on) forestAutoRemove(on) end,
 })
 
 FarmInfo:CreateStatus({
@@ -1163,12 +1299,11 @@ FarmInfo:CreateParagraph({
 })
 
 -- ==========================================================================
--- 20. BIKE TAB
+-- 21. BIKE TAB
 -- ==========================================================================
 local BikeTab  = Window:CreateTab({ Name = "Bike", Icon = "bike" })
 local BikeMain = BikeTab:CreateGroupbox({ Name = "Assist", Side = "Left" })
 local BikeTune = BikeTab:CreateGroupbox({ Name = "Movement", Side = "Right" })
-local BikeInfo = BikeTab:CreateGroupbox({ Name = "Status", Side = "Right" })
 
 UiRefs.wheelie = BikeMain:CreateToggle({
     Name = "Auto wheelie", Desc = "Holds a wheelie and keeps you on the bike",
@@ -1228,15 +1363,15 @@ local function tuningSlider(name, label, range, increment, suffix, flag)
     })
 end
 
-tuningSlider("MaxSpeedKmh",     "Max speed",       {40, 400}, 5,    " km/h", "TuneSpeed")
-tuningSlider("LaunchAccel",     "Launch accel",    {1, 30},   0.5,  nil,     "TuneAccel")
-tuningSlider("PowerPerKg",      "Power per kg",    {10, 250}, 5,    nil,     "TunePower")
-tuningSlider("TireGrip",        "Tire grip",       {0.2, 3},  0.05, nil,     "TuneGrip")
-tuningSlider("AirGravity",      "Air gravity",     {0, 120},  5,    nil,     "TuneAirGravity")
-tuningSlider("WheelieStrength", "Wheelie strength",{0.2, 4},  0.1,  nil,     "TuneWheelie")
-tuningSlider("BrakeDecel",      "Brake decel",     {1, 50},   1,    nil,     "TuneBrake")
-tuningSlider("SteerSpeed",      "Steer speed",     {0.5, 10}, 0.5,  nil,     "TuneSteer")
-tuningSlider("BrakePower",      "Brake power",     {0.5, 10}, 0.5,  nil,     "TuneBrakePower")
+tuningSlider("MaxSpeedKmh",     "Max speed",        {40, 400},  5,    " km/h", "TuneSpeed")
+tuningSlider("LaunchAccel",     "Launch accel",     {1, 30},    0.5,  nil,     "TuneAccel")
+tuningSlider("PowerPerKg",      "Power per kg",     {10, 400},  5,    nil,     "TunePower")
+tuningSlider("TireGrip",        "Tire grip",        {0.2, 3},   0.05, nil,     "TuneGrip")
+tuningSlider("AirGravity",      "Air gravity",      {0, 120},   5,    nil,     "TuneAirGravity")
+tuningSlider("WheelieStrength", "Wheelie strength", {0.2, 4},   0.1,  nil,     "TuneWheelie")
+tuningSlider("BrakeDecel",      "Brake decel",      {1, 50},    1,    nil,     "TuneBrake")
+tuningSlider("SteerSpeed",      "Steer speed",      {0.5, 10},  0.5,  nil,     "TuneSteer")
+tuningSlider("BrakePower",      "Brake power",      {0.5, 10},  0.5,  nil,     "TuneBrakePower")
 
 BikeTune:CreateButton({
     Name = "Reset tuning", Icon = "rotate-ccw",
@@ -1244,7 +1379,7 @@ BikeTune:CreateButton({
 })
 
 -- ==========================================================================
--- 21. ESP TAB (exposes already-existing ESP logic)
+-- 22. ESP TAB
 -- ==========================================================================
 local EspTab = Window:CreateTab({ Name = "ESP", Icon = "eye" })
 local EspBox = EspTab:CreateGroupbox({ Name = "Wallhack", Side = "Left" })
@@ -1266,7 +1401,7 @@ EspBox:CreateToggle({
 })
 
 -- ==========================================================================
--- 22. TELEPORT TAB (exposes already-existing teleport logic)
+-- 23. TELEPORT TAB
 -- ==========================================================================
 local TpTab = Window:CreateTab({ Name = "Teleport", Icon = "map-pin" })
 local TpBox = TpTab:CreateGroupbox({ Name = "Landmarks", Side = "Left" })
@@ -1287,7 +1422,7 @@ for _, name in ipairs(LANDMARKS) do
 end
 
 -- ==========================================================================
--- 23. Startup
+-- 24. Startup
 -- ==========================================================================
 log("Bike Universe Hub v2.3 loaded.")
 log("Press RightControl to toggle the UI.")

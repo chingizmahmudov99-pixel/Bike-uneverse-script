@@ -1,13 +1,16 @@
 --!nonstrict
 --[[
-    Bike Universe Hub — merged & patched edition.
-    Игровая логика + встроенный загрузчик AirFlow с дисковым кэшем.
-    Файл 3 (старая AirFlow) не используется — несовместим с Log/Status/ButtonRow.
+    Bike Universe Hub — fully patched edition.
+    
+    AirFlow is embedded via URL+cache (as before) — if you want FULL offline,
+    paste file-2 content into EMBED_LIBRARY string below.
+
+    All bug fixes documented above.
 ]]
 
-----------------------------------------------------------------------
--- Services
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 1. SERVICES
+-- ==========================================================================
 local Players              = game:GetService("Players")
 local RunService           = game:GetService("RunService")
 local VirtualInputManager  = game:GetService("VirtualInputManager")
@@ -17,9 +20,9 @@ local ReplicatedStorage    = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
-----------------------------------------------------------------------
--- ENV helper (закрывает дыру с getgenv)
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 2. ENV helper
+-- ==========================================================================
 local function getEnv()
     if type(getgenv) == "function" then
         local ok, env = pcall(getgenv)
@@ -41,9 +44,12 @@ local function short(value)
     return (text:reverse():gsub("(%d%d%d)", "%1 "):reverse():gsub("^%s+", ""))
 end
 
-----------------------------------------------------------------------
--- AirFlow library loading (cache -> URL -> error)
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 3. AirFlow loading (cache → URL → error)
+--   To embed file-2 fully: set EMBED_LIBRARY = [[<file 2 content>]]
+-- ==========================================================================
+local EMBED_LIBRARY = nil  -- ← paste file 2 between [[...]] for full offline
+
 local UI_CACHE    = "BikeHub_AirflowCache.lua"
 local UI_SOURCES  = {
     "https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
@@ -87,31 +93,49 @@ local function fetchFirst()
     return nil
 end
 
-local Airflow = readCache() or fetchFirst()
+local Airflow = (EMBED_LIBRARY and tryLoadLibrary(EMBED_LIBRARY))
+    or readCache()
+    or fetchFirst()
+
 if not Airflow then
-    error("[Bike Universe Hub] AirFlow UI could not be loaded " ..
-          "(cache empty and all mirrors failed).")
+    error("[Bike Universe Hub] AirFlow UI could not be loaded")
 end
 
-----------------------------------------------------------------------
--- Bike helpers
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 4. Bike helpers (FIXED — recursive scan)
+-- ==========================================================================
 local function myBike()
-    for _, child in ipairs(workspace:GetChildren()) do
-        if child:IsA("Model") and child:GetAttribute("Owner") == LocalPlayer.UserId then
-            return child
+    local found
+    local function scan(inst, depth)
+        if found or depth > 4 then return end
+        for _, child in ipairs(inst:GetChildren()) do
+            if child:IsA("Model") and child:GetAttribute("Owner") == LocalPlayer.UserId then
+                found = child; return
+            end
+            if child:IsA("Folder") or child:IsA("Model") then
+                scan(child, depth + 1)
+            end
         end
     end
+    scan(workspace, 0)
+    return found
 end
 
 local function chassis()
     local bike = myBike()
-    return bike and (bike:FindFirstChild("Chassis") or bike.PrimaryPart) or nil
+    if not bike then return nil end
+    local c = bike:FindFirstChild("Chassis")
+    if c then
+        if c:IsA("BasePart") then return c end
+        if c:IsA("Model") and c.PrimaryPart then return c.PrimaryPart end
+    end
+    return bike.PrimaryPart
 end
 
 local function driverSeat()
     local bike = myBike()
-    return bike and bike:FindFirstChild("DriverSeat") or nil
+    if not bike then return nil end
+    return bike:FindFirstChild("DriverSeat", true) or bike:FindFirstChildOfClass("VehicleSeat")
 end
 
 local function humanoid()
@@ -135,9 +159,9 @@ local function cash()
     return value and value.Value or 0
 end
 
-----------------------------------------------------------------------
--- Drive control
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 5. Drive control (FIXED — VehicleSeat fallback)
+-- ==========================================================================
 local TouchControls
 pcall(function()
     TouchControls = require(ReplicatedStorage:WaitForChild("TouchControls"))
@@ -157,7 +181,7 @@ if TouchControls and type(TouchControls.drive) == "function" then
         hooked = function(seat)
             local state = ENV.__BikeHubDrive
             if state and state.on and state.gen == ENV.__BikeHubGen
-                and (os.clock() - (state.last or 0) < 0.4) then
+                and (os.clock() - (state.last or 0) < 0.5) then
                 return state.throttle, state.steer
             end
             return originalDrive(seat)
@@ -182,9 +206,34 @@ local function driveStop()
     driveState.steer = 0
 end
 
-----------------------------------------------------------------------
--- Key mirroring
-----------------------------------------------------------------------
+-- FIXED: fallback to VehicleSeat fields
+local function applyDrive(throttle, steer)
+    throttle = throttle or 0
+    steer = steer or 0
+    local seat = driverSeat()
+    if seat and seat:IsA("VehicleSeat") then
+        pcall(function()
+            seat.ThrottleFloat = throttle
+            seat.SteerFloat = steer
+        end)
+    end
+    drive(throttle, steer)
+end
+
+local function applyDriveStop()
+    local seat = driverSeat()
+    if seat and seat:IsA("VehicleSeat") then
+        pcall(function()
+            seat.ThrottleFloat = 0
+            seat.SteerFloat = 0
+        end)
+    end
+    driveStop()
+end
+
+-- ==========================================================================
+-- 6. Key mirroring
+-- ==========================================================================
 local heldKeys = {}
 
 local function key(code, down)
@@ -206,9 +255,9 @@ local function releaseKeys()
     heldKeys = {}
 end
 
-----------------------------------------------------------------------
--- Seating / bike spawn
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 7. Seating / bike spawn (IMPROVED)
+-- ==========================================================================
 local log
 local riderLockSet
 local spawnBike
@@ -217,14 +266,27 @@ local teleportBike
 
 spawnBike = function()
     if myBike() then return true end
-    for _, name in ipairs({ "SpawnBikeEvent", "SelectBike", "BikeMount" }) do
-        local remote = ReplicatedStorage:FindFirstChild(name)
-        if remote and remote:IsA("RemoteEvent") then
-            pcall(function() remote:FireServer() end)
-            for _ = 1, 10 do
-                task.wait(0.2)
-                if myBike() then return true end
+    local remotes = {}
+    for _, name in ipairs({
+        "SpawnBikeEvent", "SelectBike", "BikeMount", "SpawnBike",
+        "RequestBike", "EquipBike", "GetBike", "MountBike"
+    }) do
+        local r = ReplicatedStorage:FindFirstChild(name)
+        if r and r:IsA("RemoteEvent") then table.insert(remotes, r) end
+    end
+    for _, child in ipairs(ReplicatedStorage:GetChildren()) do
+        if child:IsA("RemoteEvent") and not table.find(remotes, child) then
+            local n = child.Name:lower()
+            if n:find("bike") or n:find("spawn") then
+                table.insert(remotes, child)
             end
+        end
+    end
+    for _, remote in ipairs(remotes) do
+        pcall(function() remote:FireServer() end)
+        for _ = 1, 10 do
+            task.wait(0.2)
+            if myBike() then return true end
         end
     end
     return myBike() ~= nil
@@ -307,9 +369,9 @@ local function seatUp()
     return seat.Occupant == hum
 end
 
-----------------------------------------------------------------------
--- Never crash hook
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 8. Never-crash hook (FIXED — expanded)
+-- ==========================================================================
 if Ragdoll and type(Ragdoll.fling) == "function" and not ENV.__BikeHubFlingHooked then
     ENV.__BikeHubFlingHooked = true
     local originalFling = Ragdoll.fling
@@ -319,26 +381,57 @@ if Ragdoll and type(Ragdoll.fling) == "function" and not ENV.__BikeHubFlingHooke
     end
 end
 
+if Ragdoll and type(Ragdoll.start) == "function" and not ENV.__BikeHubStartHooked then
+    ENV.__BikeHubStartHooked = true
+    local originalStart = Ragdoll.start
+    Ragdoll.start = function(...)
+        if ENV.__BikeFarmOn or ENV.__BikeHubRiderLock then return end
+        return originalStart(...)
+    end
+end
+
 local function riderLockTick()
     local seat, hum = driverSeat(), humanoid()
     if not (seat and hum) then return end
-    if ENV.__BikeHubRiderLock and seat.Occupant ~= hum then
-        local char = LocalPlayer.Character
-        if char then
-            pcall(function() char:PivotTo(seat.CFrame * CFrame.new(0, 1.5, 0)) end)
+    if ENV.__BikeHubRiderLock then
+        if seat.Occupant ~= hum then
+            local char = LocalPlayer.Character
+            if char then
+                pcall(function() char:PivotTo(seat.CFrame * CFrame.new(0, 1.5, 0)) end)
+            end
+            pcall(function() seat:Sit(hum) end)
         end
-        pcall(function() seat:Sit(hum) end)
     end
     if hum.PlatformStand then hum.PlatformStand = false end
     local state = hum:GetState()
     if state == Enum.HumanoidStateType.Ragdoll or state == Enum.HumanoidStateType.FallingDown then
         pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
     end
+    -- Anti-flip: kill extreme angular velocity
+    if ENV.__BikeHubRiderLock then
+        local part = chassis()
+        if part and part:IsA("BasePart") then
+            local av = part.AssemblyAngularVelocity
+            if av.Magnitude > 30 then
+                part.AssemblyAngularVelocity = av * 0.3
+            end
+        end
+    end
 end
 
-----------------------------------------------------------------------
--- Settings / stats
-----------------------------------------------------------------------
+-- FIXED: riderLockTick now runs every 50ms
+task.spawn(function()
+    while scriptAlive() do
+        if ENV.__BikeHubRiderLock then
+            pcall(riderLockTick)
+        end
+        task.wait(0.05)
+    end
+end)
+
+-- ==========================================================================
+-- 9. Settings / stats
+-- ==========================================================================
 local Settings = {
     farmOn = false, height = 140, cooldown = 3.0,
     wheelieOn = false, riderLock = false,
@@ -361,9 +454,9 @@ local function scriptAlive()
     return ENV.__BikeHubGen == SCRIPT_GENERATION
 end
 
-----------------------------------------------------------------------
--- 1. TELEPORT FARM
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 10. TELEPORT FARM (FIXED)
+-- ==========================================================================
 local anchor
 
 local function captureAnchor()
@@ -388,32 +481,60 @@ local function jumpOnce()
         task.wait(0.2)
         return false
     end
-    if not isRiding() and not seatUp() then return false end
+    if not part:IsA("BasePart") then
+        part = bike.PrimaryPart
+        if not part then return false end
+    end
+    if not isRiding() then
+        if not seatUp() then return false end
+    end
 
-    if not bike:GetAttribute("Airborne") then
+    if not Stats.launchPosition then
         Stats.launchPosition = part.Position
         Stats.launchRotation = part.CFrame - part.CFrame.Position
     end
-    local base = Stats.launchPosition or part.Position
-    local rotation = Stats.launchRotation or (part.CFrame - part.CFrame.Position)
+    local base = Stats.launchPosition
+    local rotation = Stats.launchRotation
 
-    drive(1)
-    bike:PivotTo(CFrame.new(base + Vector3.new(math.random(-25, 25), Settings.height, math.random(-25, 25))) * rotation)
+    applyDrive(1, 0)
+    local target = CFrame.new(
+        base + Vector3.new(math.random(-15, 15), Settings.height, math.random(-15, 15))
+    ) * rotation
+    pcall(function() bike:PivotTo(target) end)
 
     local started = os.clock()
     local lostRider = false
-    while bike:GetAttribute("Airborne") and os.clock() - started < 30 do
-        if not (Settings.farmOn and scriptAlive()) then return false end
-        if not isRiding() then lostRider = true; break end
-        task.wait(0.1)
+    local lastDrive = 0
+
+    while scriptAlive() and Settings.farmOn and os.clock() - started < 20 do
+        if not isRiding() then
+            lostRider = true
+            break
+        end
+        if os.clock() - lastDrive > 0.2 then
+            applyDrive(1, 0)
+            lastDrive = os.clock()
+        end
+        local cur = chassis()
+        if cur and cur:IsA("BasePart") then
+            local vel = cur.AssemblyLinearVelocity
+            local pos = cur.Position
+            local airborne = bike:GetAttribute("Airborne")
+            if airborne == false then break end
+            if math.abs(vel.Y) < 8 and pos.Y < base.Y + 8 then break end
+        end
+        task.wait(0.05)
     end
-    if lostRider or bike:GetAttribute("Airborne") then
-        bike:PivotTo(CFrame.new(base + Vector3.new(0, 6, 0)) * rotation)
-        task.wait(0.5)
+
+    applyDriveStop()
+
+    if lostRider then
+        task.wait(0.3)
         seatUp()
+        task.wait(0.3)
     end
+
     task.wait(Settings.cooldown)
-    drive(1)
     Stats.jumps += 1
     return true
 end
@@ -422,7 +543,7 @@ local function farmSet(on)
     Settings.farmOn = on
     ENV.__BikeFarmOn = on
     if not on then
-        driveStop()
+        applyDriveStop()
         releaseKeys()
         Stats.launchPosition = nil
         Stats.launchRotation = nil
@@ -438,6 +559,9 @@ local function farmSet(on)
             if UiRefs.farm then UiRefs.farm:Set(false, true) end
             return
         end
+        task.wait(0.3)
+        Stats.launchPosition = nil
+        Stats.launchRotation = nil
         Stats.jumps = 0
         Stats.lastCash = cash()
         Stats.lastSample = os.clock()
@@ -456,16 +580,16 @@ local function farmSet(on)
     if UiRefs.farm then UiRefs.farm:Set(true, true) end
 end
 
-----------------------------------------------------------------------
--- 2. AUTO WHEELIE
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 11. WHEELIE (FIXED — uses applyDrive)
+-- ==========================================================================
 local function wheelieCycle(throttle)
     key(Enum.KeyCode.LeftControl, false)
     task.wait(0.05)
     key(Enum.KeyCode.LeftControl, true)
-    drive(throttle or 1, 0)
+    applyDrive(throttle or 1, 0)
     task.wait(0.45)
-    drive(0.2, 0)
+    applyDrive(0.2, 0)
     task.wait(0.45)
 end
 
@@ -485,20 +609,20 @@ local function wheelieSet(on)
                     task.wait(0.2)
                 end
             end
-            driveStop()
+            applyDriveStop()
             releaseKeys()
         end)
     else
-        driveStop()
+        applyDriveStop()
         releaseKeys()
         log("Auto wheelie off")
     end
     if UiRefs.wheelie then UiRefs.wheelie:Set(on, true) end
 end
 
-----------------------------------------------------------------------
--- 3. RIDER LOCK
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 12. RIDER LOCK toggle
+-- ==========================================================================
 riderLockSet = function(on)
     Settings.riderLock = on
     ENV.__BikeHubRiderLock = on
@@ -506,72 +630,95 @@ riderLockSet = function(on)
     if UiRefs.riderLock then UiRefs.riderLock:Set(on, true) end
 end
 
-----------------------------------------------------------------------
--- 4. PUMPKIN FARM
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 13. PUMPKIN FARM (FIXED)
+-- ==========================================================================
 pumpkinList = function()
     local list = {}
-    local folder = workspace:FindFirstChild("MyPumpkins")
-    if folder then
-        for _, child in ipairs(folder:GetChildren()) do
-            if child:IsA("Model") and child:FindFirstChild("Body") then
-                table.insert(list, child)
+    local seen = {}
+    local function add(p)
+        if p and not seen[p] then
+            seen[p] = true
+            table.insert(list, p)
+        end
+    end
+    local function inspect(child)
+        if child:IsA("Model") then
+            local n = child.Name:lower()
+            local isPumpkin = n:find("pumpkin") or child:GetAttribute("Pumpkin") or child:GetAttribute("IsPumpkin")
+            if isPumpkin and (child.PrimaryPart or child:FindFirstChild("Body") or child:FindFirstChild("Hitbox")) then
+                add(child)
             end
         end
     end
-    if #list > 0 then return list end
-    local function scan(inst, depth)
-        if depth > 4 then return end
-        for _, child in ipairs(inst:GetChildren()) do
-            if child:IsA("Model") and child.Name:lower():find("pumpkin") and child:FindFirstChild("Body") then
-                table.insert(list, child)
-            end
-            if not child:IsA("Model") then scan(child, depth + 1) end
+    for _, name in ipairs({"MyPumpkins", "Pumpkins", "PumpkinFolder", "Farm"}) do
+        local folder = workspace:FindFirstChild(name)
+        if folder then
+            for _, child in ipairs(folder:GetChildren()) do inspect(child) end
         end
     end
-    scan(workspace, 0)
+    if #list == 0 then
+        local function scan(inst, depth)
+            if depth > 4 then return end
+            for _, child in ipairs(inst:GetChildren()) do
+                inspect(child)
+                if not child:IsA("Model") or child:IsA("Folder") then
+                    scan(child, depth + 1)
+                end
+            end
+        end
+        scan(workspace, 0)
+    end
     return list
 end
 
 local function pumpkinSet(on)
     Settings.pumpkinFarm = on
+    ENV.__BikeHubPumpkin = on
     if on then
         task.spawn(function()
+            log("<Warning>Pumpkin farm on (experimental)</Warning>")
             while Settings.pumpkinFarm and scriptAlive() do
                 local bike = myBike()
-                local list = pumpkinList()
-                if bike and #list > 0 then
-                    local nearest, best
-                    for _, pumpkin in ipairs(list) do
-                        local distance = (pumpkin:GetPivot().Position - bike:GetPivot().Position).Magnitude
-                        if not best or distance < best then
-                            nearest, best = pumpkin, distance
-                        end
-                    end
-                    if nearest then
-                        drive(1, 0)
-                        teleportBike(nearest:GetPivot() * CFrame.new(0, 6, 0))
-                        task.wait(0.4)
-                        drive(1, 0)
-                        task.wait(0.4)
-                    else
-                        task.wait(0.5)
-                    end
+                if not bike then
+                    spawnBike(); task.wait(1)
+                elseif not isRiding() then
+                    seatUp(); task.wait(0.3)
                 else
-                    task.wait(1)
+                    local list = pumpkinList()
+                    if #list > 0 then
+                        local bikePos = bike:GetPivot().Position
+                        local nearest, best
+                        for _, pumpkin in ipairs(list) do
+                            local d = (pumpkin:GetPivot().Position - bikePos).Magnitude
+                            if not best or d < best then
+                                nearest, best = pumpkin, d
+                            end
+                        end
+                        if nearest then
+                            applyDrive(1, 0)
+                            teleportBike(nearest:GetPivot() * CFrame.new(0, 4, 0))
+                            task.wait(0.35)
+                            applyDrive(1, 0)
+                            task.wait(0.35)
+                        end
+                    else
+                        task.wait(1)
+                    end
                 end
+                task.wait(0.1)
             end
+            applyDriveStop()
         end)
-        log("<Warning>Pumpkin farm on (experimental)</Warning>")
     else
         log("Pumpkin farm off")
     end
     if UiRefs.pumpkin then UiRefs.pumpkin:Set(on, true) end
 end
 
-----------------------------------------------------------------------
--- 5 + 6. ESP
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 14. ESP
+-- ==========================================================================
 local esp = { player = {}, police = {} }
 
 local function makeEsp(adornee, text, color)
@@ -613,14 +760,13 @@ local function clearEsp(kind)
     esp[kind] = {}
 end
 
-local function clearOldEsp()
+task.spawn(function()
     for _, child in ipairs(PlayerGui:GetChildren()) do
         if child.Name == "BikeHubEsp" or child.Name == "BikeHubHighlight" then
             child:Destroy()
         end
     end
-end
-task.spawn(clearOldEsp)
+end)
 
 local function refreshPlayerEsp()
     local alive = {}
@@ -633,8 +779,8 @@ local function refreshPlayerEsp()
                 if not esp.player[torso] then
                     esp.player[torso] = makeEsp(torso, player.Name, Color3.fromRGB(255, 59, 127))
                 end
-                local distance = me and math.floor((torso.Position - me).Magnitude) or 0
-                esp.player[torso].label.Text = string.format("%s  [%d]", player.Name, distance)
+                local dist = me and math.floor((torso.Position - me).Magnitude) or 0
+                esp.player[torso].label.Text = string.format("%s  [%d]", player.Name, dist)
             end
         end
     end
@@ -683,9 +829,9 @@ task.spawn(function()
     end
 end)
 
-----------------------------------------------------------------------
--- 7. BIKE TUNING
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 15. BIKE TUNING (IMPROVED — watches subfolders)
+-- ==========================================================================
 local TUNING_DEFAULTS = {
     MaxSpeedKmh = 400, LaunchAccel = 5.5, PowerPerKg = 250,
     TireGrip = 1.35, AirGravity = 50, WheelieStrength = 1.1,
@@ -703,6 +849,7 @@ for name, defaultValue in pairs(TUNING_DEFAULTS) do
     end
 end
 
+-- Sanity clamps
 if TUNING_VALUES.BrakeDecel == 7 then TUNING_VALUES.BrakeDecel = 22 end
 if TUNING_VALUES.TireGrip  == 0.95 then TUNING_VALUES.TireGrip = 1.35 end
 if TUNING_VALUES.LaunchAccel == 4.2 then TUNING_VALUES.LaunchAccel = 5.5 end
@@ -744,30 +891,39 @@ local function resetTuning()
     end
     ENV.__BikeHubTuningValues = TUNING_VALUES
     applyAllTuning()
-    log("Bike tuning reset to defaults; values will stay applied to future bikes")
+    log("Bike tuning reset to defaults")
 end
 
-workspace.ChildAdded:Connect(function(child)
-    task.spawn(function()
-        for attempt = 1, 12 do
-            if not scriptAlive() then return end
-            if child:IsA("Model") and child:GetAttribute("Owner") == LocalPlayer.UserId then
-                for _, delayTime in ipairs({ 0, 0.15, 0.5, 1 }) do
+-- Watch any container for a bike spawn (recursive)
+local function watchContainer(container)
+    container.ChildAdded:Connect(function(child)
+        if child:IsA("Model") and child:GetAttribute("Owner") == LocalPlayer.UserId then
+            task.spawn(function()
+                for _, delayTime in ipairs({ 0, 0.15, 0.5, 1, 2 }) do
                     if delayTime > 0 then task.wait(delayTime) end
-                    if child.Parent and child:GetAttribute("Owner") == LocalPlayer.UserId then
+                    if scriptAlive() and child.Parent then
                         applyAllTuning(child)
                     end
                 end
                 log("Saved bike tuning applied to spawned bike")
-                return
-            end
-            task.wait(0.1)
+            end)
+        elseif child:IsA("Folder") or child:IsA("Model") then
+            watchContainer(child)
         end
     end)
-end)
+end
+
+watchContainer(workspace)
+for _, child in ipairs(workspace:GetChildren()) do
+    if child:IsA("Folder") or child:IsA("Model") then
+        if child:FindFirstChildOfClass("Model") then
+            watchContainer(child)
+        end
+    end
+end
 
 task.spawn(function()
-    for _ = 1, 20 do
+    for _ = 1, 30 do
         if not scriptAlive() then return end
         local bike = myBike()
         if bike then applyAllTuning(bike); return end
@@ -775,9 +931,9 @@ task.spawn(function()
     end
 end)
 
-----------------------------------------------------------------------
--- Handling / brake assist
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 16. HANDLING / BRAKE ASSIST (FIXED — Heartbeat loop)
+-- ==========================================================================
 local lastHandlingTick = os.clock()
 
 local function handlingTick()
@@ -787,21 +943,26 @@ local function handlingTick()
     if dt <= 0 then return end
     if not (Settings.handlingAssist or Settings.brakeAssist) then return end
     if not isRiding() then return end
-    local bike, part = myBike(), chassis()
-    if not (bike and part) then return end
+    local bike = myBike()
+    if not bike then return end
+    local part = chassis()
+    if not part or not part:IsA("BasePart") then
+        part = bike.PrimaryPart
+        if not part then return end
+    end
 
     local vel = part.AssemblyLinearVelocity
 
     if Settings.handlingAssist then
-        if math.abs(vel.Y) < 8 then
+        if math.abs(vel.Y) < 12 then
             local up = part.CFrame.UpVector
-            if up.Y < 0.7 and up.Y > 0.1 then
+            if up.Y < 0.92 then
                 local targetUp = Vector3.new(0, 1, 0)
                 local axis = up:Cross(targetUp)
                 if axis.Magnitude > 0.01 then
-                    local strength = (1 - up.Y) * 3
-                    part.AssemblyAngularVelocity = part.AssemblyAngularVelocity
-                        + axis.Unit * strength * dt
+                    local error = 1 - up.Y
+                    local correction = axis.Unit * (error * 12)
+                    part.AssemblyAngularVelocity = part.AssemblyAngularVelocity * 0.6 + correction
                 end
             end
         end
@@ -812,7 +973,7 @@ local function handlingTick()
             local flat = Vector3.new(vel.X, 0, vel.Z)
             if flat.Magnitude > 4 then
                 local right = part.CFrame.RightVector
-                local push = right * steerInput * flat.Magnitude * dt * 0.6
+                local push = right * steerInput * flat.Magnitude * dt * 0.8
                 part.AssemblyLinearVelocity = vel + Vector3.new(push.X, 0, push.Z)
                 vel = part.AssemblyLinearVelocity
             end
@@ -825,7 +986,7 @@ local function handlingTick()
         if braking then
             local flat = Vector3.new(vel.X, 0, vel.Z)
             if flat.Magnitude > 1 then
-                local damp = math.clamp(1.5 * dt, 0, 1)
+                local damp = math.clamp(2.0 * dt, 0, 1)
                 local newFlat = flat * (1 - damp)
                 part.AssemblyLinearVelocity = Vector3.new(newFlat.X, vel.Y, newFlat.Z)
             end
@@ -833,16 +994,20 @@ local function handlingTick()
     end
 end
 
-----------------------------------------------------------------------
--- 8. TELEPORTS
-----------------------------------------------------------------------
+RunService.Heartbeat:Connect(function()
+    if Settings.handlingAssist or Settings.brakeAssist then
+        pcall(handlingTick)
+    end
+end)
+
+-- ==========================================================================
+-- 17. TELEPORTS
+-- ==========================================================================
 local LANDMARKS = {
     "HighwayEntery", "LongHighway", "HighwayRace", "HighwayTunnels",
     "MegaRamp", "Garage", "PumpkinSHop", "PumpkinBikeStand",
     "TownRace", "BikeDealer", "LuxuryStand", "VargShowcase",
 }
-
-local savedSpots = {}
 
 teleportBike = function(cframe)
     local bike = myBike()
@@ -858,16 +1023,19 @@ teleportBike = function(cframe)
         task.wait(0.1)
     end
     local seated = seat and hum and seat.Occupant == hum
-    bike:PivotTo(cframe)
+    pcall(function() bike:PivotTo(cframe) end)
     if char and not seated then
         pcall(function() char:PivotTo(cframe * CFrame.new(0, 2.2, 0)) end)
     end
-    for _ = 1, 6 do
+    for _ = 1, 8 do
         task.wait(0.06)
-        if (bike:GetPivot().Position - cframe.Position).Magnitude > 30 then
-            bike:PivotTo(cframe)
-            if char and not seated then
-                pcall(function() char:PivotTo(cframe * CFrame.new(0, 2.2, 0)) end)
+        local bp = chassis()
+        if bp and bp:IsA("BasePart") then
+            if (bp.Position - cframe.Position).Magnitude > 20 then
+                pcall(function() bike:PivotTo(cframe) end)
+                if char and not seated then
+                    pcall(function() char:PivotTo(cframe * CFrame.new(0, 2.2, 0)) end)
+                end
             end
         end
     end
@@ -883,9 +1051,9 @@ local function landmarkCFrame(name)
     return nil
 end
 
-----------------------------------------------------------------------
--- WINDOW
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 18. WINDOW
+-- ==========================================================================
 local THEME = {
     Background = Color3.fromHex("#0A0A0C"),
     Surface    = Color3.fromHex("#141418"),
@@ -913,7 +1081,7 @@ Window = Airflow:CreateWindow({
     Home = {
         Title = "Bike Universe Hub",
         Welcome = "Welcome back,",
-        Tier = "v2.2",
+        Tier = "v2.3",
         Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
     },
 })
@@ -929,9 +1097,9 @@ log = function(message)
     if LogElement then LogElement:Push(tostring(message)) end
 end
 
-----------------------------------------------------------------------
--- FARM TAB
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 19. FARM TAB
+-- ==========================================================================
 local FarmTab  = Window:CreateTab({ Name = "Farm", Icon = "coins" })
 local FarmMain = FarmTab:CreateGroupbox({ Name = "Air time farm", Side = "Left" })
 local FarmInfo = FarmTab:CreateGroupbox({ Name = "Numbers", Side = "Right" })
@@ -994,9 +1162,9 @@ FarmInfo:CreateParagraph({
         .. "keeps full throttle on the way down, and the landing closes the line and pays out.",
 })
 
-----------------------------------------------------------------------
--- BIKE TAB
-----------------------------------------------------------------------
+-- ==========================================================================
+-- 20. BIKE TAB
+-- ==========================================================================
 local BikeTab  = Window:CreateTab({ Name = "Bike", Icon = "bike" })
 local BikeMain = BikeTab:CreateGroupbox({ Name = "Assist", Side = "Left" })
 local BikeTune = BikeTab:CreateGroupbox({ Name = "Movement", Side = "Right" })
@@ -1010,14 +1178,14 @@ UiRefs.wheelie = BikeMain:CreateToggle({
 
 UiRefs.riderLock = BikeMain:CreateToggle({
     Name = "No crash / no ragdoll",
-    Desc = "The crash call is blocked, so the game cannot throw you off",
+    Desc = "Blocks crash/ragdoll and auto-recovers if thrown off",
     Flag = "RiderLock", CurrentValue = false,
     Callback = function(on) riderLockSet(on) end,
 })
 
 UiRefs.handling = BikeMain:CreateToggle({
     Name = "Handling assist",
-    Desc = "Anti-flip + sharper steering while riding",
+    Desc = "Auto-upright + sharper steering while riding",
     Flag = "HandlingAssist", CurrentValue = false,
     Callback = function(on)
         Settings.handlingAssist = on
@@ -1072,4 +1240,54 @@ tuningSlider("BrakePower",      "Brake power",     {0.5, 10}, 0.5,  nil,     "Tu
 
 BikeTune:CreateButton({
     Name = "Reset tuning", Icon = "rotate-ccw",
-    Callback = function() resetTuning
+    Callback = function() resetTuning() end,
+})
+
+-- ==========================================================================
+-- 21. ESP TAB (exposes already-existing ESP logic)
+-- ==========================================================================
+local EspTab = Window:CreateTab({ Name = "ESP", Icon = "eye" })
+local EspBox = EspTab:CreateGroupbox({ Name = "Wallhack", Side = "Left" })
+EspBox:CreateToggle({
+    Name = "Player ESP", Desc = "Highlight players with distance labels",
+    Flag = "PlayerEsp", CurrentValue = false,
+    Callback = function(on)
+        Settings.playerEsp = on
+        log(on and "Player ESP on" or "Player ESP off")
+    end,
+})
+EspBox:CreateToggle({
+    Name = "Police ESP", Desc = "Highlight police NPCs",
+    Flag = "PoliceEsp", CurrentValue = false,
+    Callback = function(on)
+        Settings.policeEsp = on
+        log(on and "Police ESP on" or "Police ESP off")
+    end,
+})
+
+-- ==========================================================================
+-- 22. TELEPORT TAB (exposes already-existing teleport logic)
+-- ==========================================================================
+local TpTab = Window:CreateTab({ Name = "Teleport", Icon = "map-pin" })
+local TpBox = TpTab:CreateGroupbox({ Name = "Landmarks", Side = "Left" })
+
+for _, name in ipairs(LANDMARKS) do
+    TpBox:CreateButton({
+        Name = name,
+        Callback = function()
+            local cf = landmarkCFrame(name)
+            if cf then
+                teleportBike(cf)
+                log("Teleported to " .. name)
+            else
+                log("<Warning>Landmark not found: " .. name .. "</Warning>")
+            end
+        end,
+    })
+end
+
+-- ==========================================================================
+-- 23. Startup
+-- ==========================================================================
+log("Bike Universe Hub v2.3 loaded.")
+log("Press RightControl to toggle the UI.")

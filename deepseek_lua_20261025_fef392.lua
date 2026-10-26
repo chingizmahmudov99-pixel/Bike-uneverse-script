@@ -1,13 +1,13 @@
 --!nonstrict
 --[[
-    Bike Universe Hub v2.4 — anti-detection farm edition.
+    Bike Universe Hub v3.0 — tuning and UI refresh.
 
-    New in v2.4:
+    Tuning/UI refresh in v3.0:
       • Stealth smooth jumps (interpolated, no teleport spikes)
       • Chain jumps (immediate re-jump on landing detection)
       • Auto tricks (spin/flip/barrel while airborne)
-      • Randomize height/landing/timing (defeats pattern AC)
-      • Safe speed cap toggle (bypasses speed-based AC)
+      • Retains existing randomized movement option
+      • Optional conservative speed cap
       • Landing detection (velocity.Y≈0 + position≈ground)
 ]]
 
@@ -1013,8 +1013,20 @@ end)
 -- ==========================================================================
 -- 16. BIKE TUNING
 -- ==========================================================================
+local TUNING_LIMITS = {
+    MaxSpeedKmh = { min = 40, max = 300 },
+    LaunchAccel = { min = 1, max = 30 },
+    PowerPerKg = { min = 10, max = 500 },
+    TireGrip = { min = 0.2, max = 3 },
+    AirGravity = { min = 0, max = 120 },
+    WheelieStrength = { min = 0.2, max = 4 },
+    BrakeDecel = { min = 1, max = 50 },
+    SteerSpeed = { min = 0.5, max = 10 },
+    BrakePower = { min = 0.5, max = 10 },
+}
+
 local TUNING_DEFAULTS = {
-    MaxSpeedKmh = 400, LaunchAccel = 5.5, PowerPerKg = 250,
+    MaxSpeedKmh = 300, LaunchAccel = 8, PowerPerKg = 500,
     TireGrip = 1.35, AirGravity = 50, WheelieStrength = 1.1,
     BrakeDecel = 22, SteerSpeed = 3.5, BrakePower = 2.0,
 }
@@ -1033,13 +1045,14 @@ end
 if TUNING_VALUES.BrakeDecel == 7 then TUNING_VALUES.BrakeDecel = 22 end
 if TUNING_VALUES.TireGrip  == 0.95 then TUNING_VALUES.TireGrip = 1.35 end
 if TUNING_VALUES.LaunchAccel == 4.2 then TUNING_VALUES.LaunchAccel = 5.5 end
-if TUNING_VALUES.MaxSpeedKmh > 400 then TUNING_VALUES.MaxSpeedKmh = 400 end
-if TUNING_VALUES.PowerPerKg > 400 then TUNING_VALUES.PowerPerKg = 400 end
-if TUNING_VALUES.TireGrip > 3 then TUNING_VALUES.TireGrip = 3 end
-if TUNING_VALUES.BrakeDecel > 50 then TUNING_VALUES.BrakeDecel = 50 end
-if TUNING_VALUES.LaunchAccel > 30 then TUNING_VALUES.LaunchAccel = 30 end
-if TUNING_VALUES.SteerSpeed > 10 then TUNING_VALUES.SteerSpeed = 10 end
-if TUNING_VALUES.BrakePower > 10 then TUNING_VALUES.BrakePower = 10 end
+for name, limits in pairs(TUNING_LIMITS) do
+    local current = TUNING_VALUES[name]
+    if type(current) ~= "number" then
+        TUNING_VALUES[name] = TUNING_DEFAULTS[name]
+    else
+        TUNING_VALUES[name] = math.clamp(current, limits.min, limits.max)
+    end
+end
 
 local function applyTuningToBike(bike, name, value)
     if bike and bike.Parent and bike:IsA("Model") then
@@ -1059,7 +1072,9 @@ local function applyAllTuning(bike)
 end
 
 local function applyTuning(name, value)
-    if TUNING_DEFAULTS[name] == nil or type(value) ~= "number" then return end
+    local limits = TUNING_LIMITS[name]
+    if not limits or type(value) ~= "number" or value ~= value then return end
+    value = math.clamp(value, limits.min, limits.max)
     TUNING_VALUES[name] = value
     ENV.__BikeHubTuningValues = TUNING_VALUES
     applyTuningToBike(myBike(), name, value)
@@ -1231,16 +1246,16 @@ end
 -- 19. WINDOW
 -- ==========================================================================
 local THEME = {
-    Background = Color3.fromHex("#0A0A0C"),
-    Surface    = Color3.fromHex("#141418"),
-    Surface2   = Color3.fromHex("#1A1A20"),
-    Surface3   = Color3.fromHex("#2A2A33"),
-    Stroke     = Color3.fromHex("#26262E"),
-    StrokeHover= Color3.fromHex("#3C3C49"),
-    Accent     = Color3.fromHex("#FF3B7F"),
-    AccentDark = Color3.fromHex("#1A0710"),
-    Text       = Color3.fromHex("#F5F5F7"),
-    Muted      = Color3.fromHex("#8D8D99"),
+    Background = Color3.fromHex("#080B12"),
+    Surface    = Color3.fromHex("#111827"),
+    Surface2   = Color3.fromHex("#172033"),
+    Surface3   = Color3.fromHex("#25314A"),
+    Stroke     = Color3.fromHex("#29364F"),
+    StrokeHover= Color3.fromHex("#425477"),
+    Accent     = Color3.fromHex("#38BDF8"),
+    AccentDark = Color3.fromHex("#082F49"),
+    Text       = Color3.fromHex("#F8FAFC"),
+    Muted      = Color3.fromHex("#94A3B8"),
 }
 
 Airflow.ThemePresets.Robscript = THEME
@@ -1248,7 +1263,7 @@ Airflow:SetDefaultTheme(THEME)
 
 Window = Airflow:CreateWindow({
     Name = "Bike Universe Hub",
-    LoadingSubtitle = "farm, tricks, ESP",
+    LoadingSubtitle = "Bike tuning • handling • controls",
     ToggleUIKeybind = "RightControl",
     Size = UDim2.fromOffset(780, 540),
     Backdrop = { Weather = "Fireflies", Tint = 0.35 },
@@ -1257,7 +1272,7 @@ Window = Airflow:CreateWindow({
     Home = {
         Title = "Bike Universe Hub",
         Welcome = "Welcome back,",
-        Tier = "v2.4",
+        Tier = "v3.0",
         Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
     },
 })
@@ -1487,9 +1502,9 @@ local function tuningSlider(name, label, range, increment, suffix, flag)
     })
 end
 
-tuningSlider("MaxSpeedKmh",     "Max speed",        {40, 400},  5,    " km/h", "TuneSpeed")
-tuningSlider("LaunchAccel",     "Launch accel",     {1, 30},    0.5,  nil,     "TuneAccel")
-tuningSlider("PowerPerKg",      "Power per kg",     {10, 400},  5,    nil,     "TunePower")
+tuningSlider("MaxSpeedKmh",     "Max speed",        {40, 300},  5,    " km/h", "TuneSpeed")
+tuningSlider("LaunchAccel",     "Acceleration",     {1, 30},    0.5,  nil,     "TuneAccel")
+tuningSlider("PowerPerKg",      "Power per kg",     {10, 500},  5,    nil,     "TunePower")
 tuningSlider("TireGrip",        "Tire grip",        {0.2, 3},   0.05, nil,     "TuneGrip")
 tuningSlider("AirGravity",      "Air gravity",      {0, 120},   5,    nil,     "TuneAirGravity")
 tuningSlider("WheelieStrength", "Wheelie strength", {0.2, 4},   0.1,  nil,     "TuneWheelie")
@@ -1548,6 +1563,6 @@ end
 -- ==========================================================================
 -- 24. Startup
 -- ==========================================================================
-log("Bike Universe Hub v2.4 loaded.")
-log("Stealth farm: smooth + chain + tricks + randomization")
+log("Bike Universe Hub v3.0 loaded.")
+log("Tuning UI ready: max speed 300 km/h, power per kg 500")
 log("Press RightControl to toggle the UI.")

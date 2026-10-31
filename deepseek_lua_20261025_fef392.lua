@@ -10,7 +10,7 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
 -- ==========================================================================
--- 2. ENV + generation (early — scriptAlive used in §8)
+-- 2. ENV + generation
 -- ==========================================================================
 local function getEnv()
     if type(getgenv) == "function" then
@@ -39,6 +39,9 @@ local function short(value)
     local text = tostring(math.floor(value))
     return (text:reverse():gsub("(%d%d%d)", "%1 "):reverse():gsub("^%s+", ""))
 end
+
+-- [FIX] no-op stub so log() can be safely called before UI exists
+local log = function() end
 
 -- ==========================================================================
 -- 3. AirFlow loading
@@ -97,7 +100,7 @@ if not Airflow then
 end
 
 -- ==========================================================================
--- 4. Bike helpers (cached)
+-- 4. Bike helpers
 -- ==========================================================================
 local bikeCache = nil
 local bikeCacheLastScan = 0
@@ -114,7 +117,7 @@ end)
 local function scanForBike()
     local found
     local function scan(inst, depth)
-        if found or depth > 4 then return end
+        if found or depth > 5 then return end
         for _, child in ipairs(inst:GetChildren()) do
             if child:IsA("Model") and child:GetAttribute("Owner") == LocalPlayer.UserId then
                 found = child; return
@@ -172,15 +175,23 @@ local function bikePosition()
     return bike and bike:GetPivot().Position or nil
 end
 
+-- [FIX] null-safe isRiding
 local function isRiding()
     local seat, hum = driverSeat(), humanoid()
-    return seat ~= nil and hum ~= nil and seat.Occupant == hum
+    if not seat or not hum then return false end
+    local ok, occ = pcall(function() return seat.Occupant end)
+    if not ok then return false end
+    return occ == hum
 end
 
+-- [FIX] null-safe cash
 local function cash()
     local stats = LocalPlayer:FindFirstChild("leaderstats")
-    local value = stats and stats:FindFirstChild("Cash")
-    return value and value.Value or 0
+    if not stats then return 0 end
+    local value = stats:FindFirstChild("Cash")
+    if not value then return 0 end
+    local ok, v = pcall(function() return value.Value end)
+    return (ok and type(v) == "number") and v or 0
 end
 
 -- ==========================================================================
@@ -230,6 +241,7 @@ local function driveStop()
     driveState.steer = 0
 end
 
+-- [FIX] set both integer and float throttle/steer — some games read only one
 local function applyDrive(throttle, steer)
     throttle = throttle or 0
     steer = steer or 0
@@ -238,6 +250,8 @@ local function applyDrive(throttle, steer)
         pcall(function()
             seat.ThrottleFloat = throttle
             seat.SteerFloat = steer
+            seat.Throttle = throttle > 0 and 1 or (throttle < 0 and -1 or 0)
+            seat.Steer = steer > 0 and 1 or (steer < 0 and -1 or 0)
         end)
     end
     drive(throttle, steer)
@@ -249,6 +263,8 @@ local function applyDriveStop()
         pcall(function()
             seat.ThrottleFloat = 0
             seat.SteerFloat = 0
+            seat.Throttle = 0
+            seat.Steer = 0
         end)
     end
     driveStop()
@@ -281,12 +297,12 @@ end
 -- ==========================================================================
 -- 7. Seating / bike spawn
 -- ==========================================================================
-local log
 local riderLockSet
 local spawnBike
 local pumpkinList
 local teleportBike
 
+-- [FIX] retry each remote twice before giving up
 spawnBike = function()
     if myBike() then return true end
     local remotes = {}
@@ -305,13 +321,19 @@ spawnBike = function()
             end
         end
     end
+    if #remotes == 0 then
+        log("<Warning>No spawn remotes found</Warning>")
+        return false
+    end
     for _, remote in ipairs(remotes) do
-        bikeCache = nil
-        bikeCacheLastScan = 0
-        pcall(function() remote:FireServer() end)
-        for _ = 1, 10 do
-            task.wait(0.2)
-            if myBike() then return true end
+        for _ = 1, 2 do
+            bikeCache = nil
+            bikeCacheLastScan = 0
+            pcall(function() remote:FireServer() end)
+            for _ = 1, 5 do
+                task.wait(0.2)
+                if myBike() then return true end
+            end
         end
     end
     return myBike() ~= nil
@@ -415,16 +437,22 @@ if Ragdoll and type(Ragdoll.start) == "function" and not ENV.__BikeHubStartHooke
     end
 end
 
+-- [FIX] re-sit cooldown to prevent spam
+local lastReseat = 0
 local function riderLockTick()
     local seat, hum = driverSeat(), humanoid()
     if not (seat and hum) then return end
     if ENV.__BikeHubRiderLock then
         if seat.Occupant ~= hum then
-            local char = LocalPlayer.Character
-            if char then
-                pcall(function() char:PivotTo(seat.CFrame * CFrame.new(0, 1.5, 0)) end)
+            local now = os.clock()
+            if (now - lastReseat) > 0.5 then
+                lastReseat = now
+                local char = LocalPlayer.Character
+                if char then
+                    pcall(function() char:PivotTo(seat.CFrame * CFrame.new(0, 1.5, 0)) end)
+                end
+                pcall(function() seat:Sit(hum) end)
             end
-            pcall(function() seat:Sit(hum) end)
         end
     end
     if hum.PlatformStand then hum.PlatformStand = false end
@@ -457,12 +485,12 @@ end)
 -- ==========================================================================
 local Settings = {
     farmOn = false,
-    height = 140,
+    height = 300,
     cooldown = 0.6,
     wheelieOn = false, riderLock = false,
     handlingAssist = false, brakeAssist = false,
     pumpkinFarm = false, playerEsp = false, policeEsp = false,
-    -- farm v2.4
+    -- farm v3.2
     stealthMode = true,
     chainJumps = true,
     tricksEnabled = false,
@@ -470,17 +498,30 @@ local Settings = {
     randomizeLanding = true,
     jumpDuration = 1.2,
     safeSpeed = false,
+    -- [NEW] fine-tune knobs
+    landingTolerance = 20,
+    settleTime = 0.30,
+    holdAtApex = 0.15,
+    chainPause = 0.25,
+    preJumpThrottle = 0.08,
+    autoRecover = true,
 }
 
+-- [NEW] extra stat fields
 local Stats = {
     jumps = 0, lastCash = 0, lastSample = 0, perMinute = 0,
+    totalAirtime = 0, bestAirtime = 0,
+    sessionStartCash = nil,
+    lastJumpCash = 0,
+    failedJumps = 0,
+    farmStartTime = 0,
 }
 
 local Window
 local UiRefs = {}
 
 -- ==========================================================================
--- 10. TELEPORT FARM — v2.4 (stealth + chain + tricks)
+-- 10. TELEPORT FARM — v3.2
 -- ==========================================================================
 local function smoothTeleport(bike, fromCF, toCF, duration)
     if duration <= 0 then
@@ -492,8 +533,7 @@ local function smoothTeleport(bike, fromCF, toCF, duration)
         local t = (os.clock() - startTime) / duration
         if t >= 1 then break end
         local eased = t * t * (3 - 2 * t)
-        local cf = fromCF:Lerp(toCF, eased)
-        pcall(function() bike:PivotTo(cf) end)
+        pcall(function() bike:PivotTo(fromCF:Lerp(toCF, eased)) end)
         task.wait(0.03)
     end
     if scriptAlive() and Settings.farmOn then
@@ -501,24 +541,32 @@ local function smoothTeleport(bike, fromCF, toCF, duration)
     end
 end
 
-local function applyTrick(part, kind)
+-- [FIX] persistent trick — applies angular velocity repeatedly for ~1.5s
+local function applyTrickOnce(part, kind)
     if not part or not part:IsA("BasePart") then return end
-    local power = 15
-    local trick
+    local power = 28
+    local axis
     if kind == "spin" then
-        trick = Vector3.new(0, power, 0)
+        axis = Vector3.new(0, 1, 0)
     elseif kind == "frontflip" then
-        trick = part.CFrame.RightVector * power
+        axis = part.CFrame.RightVector
     elseif kind == "backflip" then
-        trick = part.CFrame.RightVector * -power
+        axis = -part.CFrame.RightVector
     elseif kind == "barrel" then
-        trick = part.CFrame.LookVector * power
+        axis = part.CFrame.LookVector
     end
-    if trick then
-        pcall(function()
-            part.AssemblyAngularVelocity = part.AssemblyAngularVelocity + trick
-        end)
-    end
+    if not axis then return end
+    pcall(function()
+        part.AssemblyAngularVelocity = part.AssemblyAngularVelocity + axis.Unit * power
+    end)
+end
+
+local function freezePart(part)
+    if not part or not part:IsA("BasePart") then return end
+    pcall(function()
+        part.AssemblyLinearVelocity  = Vector3.zero
+        part.AssemblyAngularVelocity = Vector3.zero
+    end)
 end
 
 local function jumpOnce()
@@ -530,83 +578,130 @@ local function jumpOnce()
     end
     if not isRiding() and not seatUp() then return false end
 
+    bike, part = myBike(), chassis()
+    if not (bike and part) then return false end
+
+    -- [FIX] freeze physics at start so we get a clean reference frame
+    freezePart(part)
     local groundPos = part.Position
-    local rotation = part.CFrame - part.CFrame.Position
+    local rotation  = part.CFrame - part.CFrame.Position
 
     local height = Settings.height
     if Settings.randomizeHeight then
         height = height * (0.85 + math.random() * 0.30)
     end
-
     local horizOff = Settings.randomizeLanding
         and Vector3.new(math.random(-8, 8), 0, math.random(-8, 8))
         or Vector3.zero
-
     local apexPos = groundPos + Vector3.new(0, height, 0) + horizOff
 
-    applyDrive(1, 0)
-
     local startCF = CFrame.new(groundPos) * rotation
-    local endCF   = CFrame.new(apexPos)   * rotation
+    local apexCF  = CFrame.new(apexPos)   * rotation
 
+    -- [FIX] short throttle burst, then STOP — prevents "engine on" during fall
+    applyDrive(1, 0)
+    task.wait(Settings.preJumpThrottle)
+    applyDriveStop()
+
+    -- Rise to apex
     if Settings.stealthMode then
-        smoothTeleport(bike, startCF, endCF, Settings.jumpDuration)
+        smoothTeleport(bike, startCF, apexCF, Settings.jumpDuration)
     else
-        pcall(function() bike:PivotTo(endCF) end)
+        pcall(function() bike:PivotTo(apexCF) end)
     end
 
-    if Settings.tricksEnabled then
-        local cur = chassis()
-        if cur and cur:IsA("BasePart") then
-            local trick = ({ "spin", "frontflip", "backflip", "barrel" })[math.random(1, 4)]
-            applyTrick(cur, trick)
+    -- [FIX] freeze at apex + brief hold so server registers position
+    local newPart = chassis()
+    if newPart and newPart:IsA("BasePart") then
+        freezePart(newPart)
+        local holdEnd = os.clock() + Settings.holdAtApex
+        while scriptAlive() and Settings.farmOn and os.clock() < holdEnd do
+            freezePart(chassis())
+            task.wait(0.03)
         end
     end
 
-    -- Wait for landing
+    -- [FIX] spawn persistent trick so it lives through the whole fall
+    if Settings.tricksEnabled then
+        local trickKind = ({ "spin", "frontflip", "backflip", "barrel" })[math.random(1, 4)]
+        task.spawn(function()
+            local t0 = os.clock()
+            while scriptAlive() and Settings.farmOn and (os.clock() - t0) < 1.5 do
+                local c = chassis()
+                if c then applyTrickOnce(c, trickKind) end
+                task.wait(0.06)
+            end
+        end)
+    end
+
+    -- [FIX] Wait for landing. NO throttle during fall.
     local startTime = os.clock()
-    local lastDrive = 0
     local tookOff = false
+    local lastY = apexPos.Y
+    local stuckTime = 0
+    local airStart = os.clock()
 
     while scriptAlive() and Settings.farmOn do
-        if os.clock() - startTime > 25 then break end
+        if os.clock() - startTime > 30 then break end
         if not isRiding() then
-            task.wait(0.3)
+            task.wait(0.25)
             seatUp()
-            task.wait(0.3)
+            task.wait(0.25)
             break
-        end
-        if os.clock() - lastDrive > 0.15 then
-            applyDrive(1, 0)
-            lastDrive = os.clock()
         end
         local cur = chassis()
         if cur and cur:IsA("BasePart") then
             local vel = cur.AssemblyLinearVelocity
             local pos = cur.Position
-            local dy = pos.Y - groundPos.Y
+            local dy  = pos.Y - groundPos.Y
 
-            if not tookOff and dy > 20 then
+            if not tookOff and dy > 25 then
                 tookOff = true
             end
 
-            if tookOff and math.abs(vel.Y) < 8 and dy < 20 then
+            if tookOff and math.abs(vel.Y) < 12 and dy < Settings.landingTolerance then
                 break -- landed
             end
-            if dy < -50 then break end -- fell through
+            if dy < -80 then break end -- fell through world
+
+            -- [NEW] un-stick: if hanging at apex for >1s, shove down
+            if tookOff and math.abs(pos.Y - lastY) < 0.5 then
+                stuckTime += 0.05
+                if stuckTime > 1 then
+                    pcall(function()
+                        cur.AssemblyLinearVelocity = Vector3.new(0, -50, 0)
+                    end)
+                    stuckTime = 0
+                end
+            else
+                stuckTime = 0
+            end
+            lastY = pos.Y
         end
         task.wait(0.05)
     end
 
-    applyDriveStop()
-    Stats.jumps += 1
-
-    if Settings.chainJumps then
-        task.wait(0.15)
-    else
-        task.wait(Settings.cooldown)
+    -- [FIX] settle after landing — hold position for server-side validation
+    local settleEnd = os.clock() + Settings.settleTime
+    while scriptAlive() and Settings.farmOn and os.clock() < settleEnd do
+        freezePart(chassis())
+        task.wait(0.04)
     end
 
+    applyDriveStop()
+
+    local air = os.clock() - airStart
+    Stats.totalAirtime += air
+    if air > Stats.bestAirtime then Stats.bestAirtime = air end
+
+    Stats.jumps += 1
+
+    -- [NEW] chain pause with humanization
+    if Settings.chainJumps then
+        task.wait(Settings.chainPause + math.random() * 0.15)
+    else
+        task.wait(Settings.cooldown + math.random() * 0.2)
+    end
     return true
 end
 
@@ -616,6 +711,20 @@ local function farmSet(on)
     if not on then
         applyDriveStop()
         releaseKeys()
+        -- [FIX] drop the bike safely if it's in the air
+        local bike = myBike()
+        local part = chassis()
+        if bike and part and part:IsA("BasePart") then
+            local ray = Ray.new(part.Position, Vector3.new(0, -500, 0))
+            local hit = workspace:FindPartOnRay(ray, bike)
+            if hit then
+                local look = part.CFrame.LookVector
+                local up   = Vector3.new(0, 1, 0)
+                pcall(function()
+                    bike:PivotTo(CFrame.lookAt(hit + Vector3.new(0, 4, 0), hit + look))
+                end)
+            end
+        end
         log("Farm off")
         if UiRefs.farm then UiRefs.farm:Set(false, true) end
         return
@@ -630,17 +739,45 @@ local function farmSet(on)
         end
         task.wait(0.3)
         Stats.jumps = 0
+        Stats.failedJumps = 0
+        Stats.totalAirtime = 0
+        Stats.bestAirtime = 0
+        Stats.farmStartTime = os.clock()
+        Stats.sessionStartCash = cash()
         Stats.lastCash = cash()
         Stats.lastSample = os.clock()
         log(string.format("Farm on — height %d, stealth=%s, chain=%s",
             Settings.height, tostring(Settings.stealthMode), tostring(Settings.chainJumps)))
+
         while Settings.farmOn and scriptAlive() do
+            local cashBefore = cash()
             local ok, err = pcall(jumpOnce)
             if not ok then
                 log("<Error>Jump: " .. tostring(err) .. "</Error>")
                 task.wait(1)
             elseif not Settings.farmOn then
                 break
+            else
+                -- [NEW] detect failed jumps (no cash change)
+                local cashDelta = cash() - cashBefore
+                Stats.lastJumpCash = cashDelta
+                if cashDelta <= 0 then
+                    Stats.failedJumps += 1
+                    if Stats.failedJumps >= 3 then
+                        log("<Warning>3 jumps, no cash — try bigger height or disable chain jumps</Warning>")
+                        Stats.failedJumps = 0
+                    end
+                else
+                    Stats.failedJumps = 0
+                end
+
+                -- [NEW] auto-recover if bike vanishes
+                if Settings.autoRecover and not myBike() then
+                    log("Bike lost — respawning")
+                    spawnBike()
+                    task.wait(0.5)
+                    seatUp()
+                end
             end
             task.wait(0.05)
         end
@@ -702,7 +839,7 @@ local function forestAutoRemove(on)
 end
 
 -- ==========================================================================
--- 12. WHEELIE
+-- 12. WHEELIE — [FIX] longer hold, pause between cycles
 -- ==========================================================================
 local wheelieAnchor
 local function captureAnchor()
@@ -715,18 +852,20 @@ local function holdAnchor()
     if not wheelieAnchor then wheelieAnchor = part.Position end
     local rotation = part.CFrame - part.CFrame.Position
     pcall(function() bike:PivotTo(CFrame.new(wheelieAnchor) * rotation) end)
-    part.AssemblyLinearVelocity = Vector3.zero
-    part.AssemblyAngularVelocity = Vector3.zero
+    pcall(function()
+        part.AssemblyLinearVelocity  = Vector3.zero
+        part.AssemblyAngularVelocity = Vector3.zero
+    end)
 end
 
 local function wheelieCycle(throttle)
     key(Enum.KeyCode.LeftControl, false)
-    task.wait(0.05)
+    task.wait(0.04)
     key(Enum.KeyCode.LeftControl, true)
     applyDrive(throttle or 1, 0)
-    task.wait(0.45)
-    applyDrive(0.2, 0)
-    task.wait(0.45)
+    task.wait(0.6)
+    applyDrive(0.25, 0)
+    task.wait(0.4)
 end
 
 local function wheelieSet(on)
@@ -744,6 +883,7 @@ local function wheelieSet(on)
                     seatUp()
                     task.wait(0.2)
                 end
+                task.wait(0.1)
             end
             applyDriveStop()
             releaseKeys()
@@ -814,11 +954,13 @@ pumpkinList = function()
         end
         if valid then return pumpkinCache end
     end
+    -- [FIX] scan folders AND non-pumpkin models (previously skipped folders in models)
     local function scan(inst, depth)
         if depth > 4 then return end
         for _, child in ipairs(inst:GetChildren()) do
-            if isPumpkinModel(child) then add(child) end
-            if not child:IsA("Model") or child:IsA("Folder") then
+            local isP = isPumpkinModel(child)
+            if isP then add(child) end
+            if child:IsA("Folder") or (child:IsA("Model") and not isP) then
                 scan(child, depth + 1)
             end
         end
@@ -1113,7 +1255,7 @@ task.spawn(function()
 end)
 
 -- ==========================================================================
--- 17. HANDLING / BRAKE ASSIST
+-- 17. HANDLING / BRAKE ASSIST — [FIX] always-on upright, softer damping
 -- ==========================================================================
 local lastHandlingTick = os.clock()
 
@@ -1132,40 +1274,50 @@ local function handlingTick()
         if not part then return end
     end
     local vel = part.AssemblyLinearVelocity
+
     if Settings.handlingAssist then
-        if math.abs(vel.Y) < 12 then
-            local up = part.CFrame.UpVector
-            if up.Y < 0.92 then
-                local axis = up:Cross(Vector3.new(0, 1, 0))
-                if axis.Magnitude > 0.01 then
-                    local errorAmt = 1 - up.Y
-                    local correction = axis.Unit * (errorAmt * 12)
-                    part.AssemblyAngularVelocity = part.AssemblyAngularVelocity * 0.6 + correction
-                end
+        -- Always auto-upright, softer correction
+        local up = part.CFrame.UpVector
+        local dot = up:Dot(Vector3.new(0, 1, 0))
+        if dot < 0.98 then
+            local axis = up:Cross(Vector3.new(0, 1, 0))
+            if axis.Magnitude > 0.01 then
+                local err = (1 - dot)
+                local correction = axis.Unit * (err * 18)
+                pcall(function()
+                    part.AssemblyAngularVelocity = part.AssemblyAngularVelocity * 0.85
+                        + correction * dt * 5
+                end)
             end
         end
+        -- Steering boost (works on ground and mid-air)
         local steerInput = 0
         if UserInputService:IsKeyDown(Enum.KeyCode.A) then steerInput -= 1 end
         if UserInputService:IsKeyDown(Enum.KeyCode.D) then steerInput += 1 end
-        if steerInput ~= 0 and math.abs(vel.Y) < 6 then
+        if steerInput ~= 0 then
             local flat = Vector3.new(vel.X, 0, vel.Z)
-            if flat.Magnitude > 4 then
+            if flat.Magnitude > 3 then
                 local right = part.CFrame.RightVector
-                local push = right * steerInput * flat.Magnitude * dt * 0.8
-                part.AssemblyLinearVelocity = vel + Vector3.new(push.X, 0, push.Z)
+                local push = right * steerInput * flat.Magnitude * dt * 1.2
+                pcall(function()
+                    part.AssemblyLinearVelocity = vel + Vector3.new(push.X, 0, push.Z)
+                end)
                 vel = part.AssemblyLinearVelocity
             end
         end
     end
+
     if Settings.brakeAssist then
         local braking = UserInputService:IsKeyDown(Enum.KeyCode.S)
             or UserInputService:IsKeyDown(Enum.KeyCode.Space)
         if braking then
             local flat = Vector3.new(vel.X, 0, vel.Z)
             if flat.Magnitude > 1 then
-                local damp = math.clamp(2.0 * dt, 0, 1)
+                local damp = math.clamp(3.5 * dt, 0, 1)
                 local newFlat = flat * (1 - damp)
-                part.AssemblyLinearVelocity = Vector3.new(newFlat.X, vel.Y, newFlat.Z)
+                pcall(function()
+                    part.AssemblyLinearVelocity = Vector3.new(newFlat.X, vel.Y, newFlat.Z)
+                end)
             end
         end
     end
@@ -1258,7 +1410,7 @@ Window = Airflow:CreateWindow({
     Home = {
         Title = "Bike Universe Hub",
         Welcome = "Welcome back,",
-        Tier = "v3.0",
+        Tier = "v3.2",
         Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
     },
 })
@@ -1283,7 +1435,7 @@ local FarmInfo = FarmTab:CreateGroupbox({ Name = "Numbers", Side = "Right" })
 
 UiRefs.farm = FarmMain:CreateToggle({
     Name = "AFK cash farm",
-    Desc = "Throws the bike up, keeps the throttle open and lets the fall pay",
+    Desc = "Throws the bike up, waits out a clean fall and lets the landing pay",
     Flag = "FarmOn", CurrentValue = false,
     Callback = function(on) farmSet(on) end,
 })
@@ -1301,6 +1453,40 @@ FarmMain:CreateSlider({
     Range = { 0.2, 3 }, Increment = 0.1, Suffix = " s",
     CurrentValue = 0.6, Flag = "JumpCooldown",
     Callback = function(value) Settings.cooldown = value end,
+})
+
+FarmMain:CreateDivider({ Text = "fine tune (v3.2)" })
+
+-- [NEW] fine-tune knobs
+FarmMain:CreateSlider({
+    Name = "Landing tolerance", Desc = "How close to ground counts as landed",
+    Range = { 5, 60 }, Increment = 1, Suffix = " studs",
+    CurrentValue = Settings.landingTolerance, Flag = "LandingTol",
+    Callback = function(value) Settings.landingTolerance = value end,
+})
+
+FarmMain:CreateSlider({
+    Name = "Post-landing settle",
+    Desc = "Hold still after touchdown so the server registers it",
+    Range = { 0, 1 }, Increment = 0.05, Suffix = " s",
+    CurrentValue = Settings.settleTime, Flag = "SettleTime",
+    Callback = function(value) Settings.settleTime = value end,
+})
+
+FarmMain:CreateSlider({
+    Name = "Apex hold",
+    Desc = "Pause at the top of the jump so the position replicates",
+    Range = { 0, 0.6 }, Increment = 0.05, Suffix = " s",
+    CurrentValue = Settings.holdAtApex, Flag = "ApexHold",
+    Callback = function(value) Settings.holdAtApex = value end,
+})
+
+FarmMain:CreateSlider({
+    Name = "Chain pause",
+    Desc = "Random-ish delay between chain jumps",
+    Range = { 0.05, 1 }, Increment = 0.05, Suffix = " s",
+    CurrentValue = Settings.chainPause, Flag = "ChainPause",
+    Callback = function(value) Settings.chainPause = value end,
 })
 
 FarmMain:CreateDivider({ Text = "anti-detection" })
@@ -1357,6 +1543,13 @@ FarmMain:CreateSlider({
     Callback = function(value) Settings.jumpDuration = value end,
 })
 
+UiRefs.autoRecover = FarmMain:CreateToggle({
+    Name = "Auto-recover",
+    Desc = "Respawns / re-seats automatically if the bike is lost",
+    Flag = "AutoRecover", CurrentValue = true,
+    Callback = function(on) Settings.autoRecover = on end,
+})
+
 FarmMain:CreateDivider({ Text = "world" })
 
 UiRefs.forestTrees = FarmMain:CreateToggle({
@@ -1366,18 +1559,53 @@ UiRefs.forestTrees = FarmMain:CreateToggle({
     Callback = function(on) forestAutoRemove(on) end,
 })
 
+-- [NEW] diagnose button
+FarmMain:CreateButton({
+    Name = "Diagnose farm", Icon = "stethoscope",
+    Callback = function()
+        local bike = myBike()
+        log("──────── Diagnose ────────")
+        log("Bike found: " .. tostring(bike ~= nil))
+        log("Seated: " .. tostring(isRiding()))
+        log("Cash: " .. short(cash()))
+        log("Height: " .. tostring(Settings.height))
+        log("Landing tol: " .. tostring(Settings.landingTolerance))
+        log("Settle: " .. tostring(Settings.settleTime))
+        log("Stealth: " .. tostring(Settings.stealthMode))
+        log("Chain: " .. tostring(Settings.chainJumps))
+        log("Tricks: " .. tostring(Settings.tricksEnabled))
+        log("PowerPerKg: " .. tostring(TUNING_VALUES.PowerPerKg))
+        log("MaxSpeedKmh: " .. tostring(TUNING_VALUES.MaxSpeedKmh))
+        log("──────────────────────────")
+    end,
+})
+
+-- [NEW] session stats
 FarmInfo:CreateStatus({
     Name = "Cash", Style = "Row", Pin = true,
     Update = function() return "<Success>" .. short(cash()) .. "</Success>" end,
 })
 
 FarmInfo:CreateStatus({
+    Name = "Session", Style = "Row",
+    Update = function()
+        if not Stats.sessionStartCash then return "-" end
+        return short(cash() - Stats.sessionStartCash)
+    end,
+})
+
+FarmInfo:CreateStatus({
     Name = "Per minute", Style = "Row",
     Update = function()
         local now = os.clock()
-        local delta = cash() - (Stats.lastCash or cash())
-        local window = now - (Stats.lastSample or now)
+        if not Stats.lastSample or Stats.lastSample == 0 then
+            Stats.lastSample = now
+            Stats.lastCash = cash()
+            return "-"
+        end
+        local window = now - Stats.lastSample
         if window > 5 then
+            local delta = cash() - Stats.lastCash
             Stats.perMinute = delta * (60 / window)
             Stats.lastSample = now
             Stats.lastCash = cash()
@@ -1391,16 +1619,34 @@ FarmInfo:CreateStatus({
     Update = function() return tostring(Stats.jumps) end,
 })
 
+-- [NEW] cash per jump
+FarmInfo:CreateStatus({
+    Name = "Cash / jump", Style = "Row",
+    Update = function()
+        if Stats.jumps == 0 or not Stats.sessionStartCash then return "-" end
+        return short((cash() - Stats.sessionStartCash) / Stats.jumps)
+    end,
+})
+
+-- [NEW] best airtime
+FarmInfo:CreateStatus({
+    Name = "Best airtime", Style = "Row",
+    Update = function() return string.format("%.2f s", Stats.bestAirtime) end,
+})
+
 FarmInfo:CreateStatus({
     Name = "Seated", Style = "Row",
     Update = function() return isRiding() and "<Success>yes</Success>" or "<Muted>no</Muted>" end,
 })
 
 FarmInfo:CreateParagraph({
-    Title = "Why it earns more now",
-    Content = "Chain jumps remove the 3s cooldown between cycles. Auto tricks multiply bonus if the game pays for them. "
-        .. "Randomized height and landing avoid pattern detection, so the loop runs longer without a kick. "
-        .. "Stealth mode interpolates movement so position jumps don't look like teleports.",
+    Title = "Why it earns more now (v3.2)",
+    Content = "The throttle is STOPPED during the fall — this is the main fix. "
+        .. "The physics are frozen at takeoff and after the apex, and the bike holds position "
+        .. "for a settle window after landing so the server registers the touchdown. "
+        .. "Chain jumps still skip the long cooldown but with a humanized 0.25s+ pause. "
+        .. "Auto tricks are now persistent (applied for ~1.5s through the fall). "
+        .. "If 3 jumps in a row give no cash, you get a warning so you can tweak height/stealth.",
 })
 
 -- ==========================================================================
@@ -1425,7 +1671,7 @@ UiRefs.riderLock = BikeMain:CreateToggle({
 
 UiRefs.handling = BikeMain:CreateToggle({
     Name = "Handling assist",
-    Desc = "Auto-upright + sharper steering while riding",
+    Desc = "Auto-upright + sharper steering (works on ground and mid-air)",
     Flag = "HandlingAssist", CurrentValue = false,
     Callback = function(on)
         Settings.handlingAssist = on
@@ -1549,6 +1795,7 @@ end
 -- ==========================================================================
 -- 24. Startup
 -- ==========================================================================
-log("Bike Universe Hub v3.0 loaded.")
-log("Tuning UI ready: max speed 300 km/h, power per kg 500")
+log("Bike Universe Hub v3.2 loaded — farm rewritten with clean landing validation")
+log("Key fixes: throttle stops during fall, physics frozen at takeoff/apex, settle after landing")
+log("Tuning: max speed 300 km/h, power per kg 500")
 log("Press RightControl to toggle the UI.")
